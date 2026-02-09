@@ -1,204 +1,205 @@
 from __future__ import annotations
 
-from typing import List
+import re
+from typing import List, Optional, Tuple
 from urllib.parse import urljoin
 
-from playwright.sync_api import Page, Playwright, sync_playwright
+from playwright.sync_api import Page, sync_playwright
 
-from ecw_scraper_data import BrokerContact, clean_contacts_dataframe, contacts_to_dataframe, save_to_csv
+from ecw_scraper_data import (
+    BrokerContact,
+    clean_contacts_dataframe,
+    contacts_to_dataframe,
+    save_to_csv,
+)
 from ecw_scraper_google_sheets import upload_dataframe_to_google_sheet
 
-IBBA_SEARCH_URL = "https://www.ibba.org/find-a-business-broker/"
+STATE_DIRECTORY_URLS: List[Tuple[str, str]] = [
+    ("New York", "https://www.ibba.org/state/new-york/"),
+    ("Florida", "https://www.ibba.org/state/florida/"),
+]
 
-DEFAULT_CITY_OR_ZIP = "Dallas, TX"
-DEFAULT_DISTANCE_LABEL = "250 Miles"
+# Narrow step: keep only brokers whose Bio/Specialties contain at least one of these
+ECW_KEYWORDS = [
+    "Car Wash",
+    "Express Wash",
+    "Tunnel Wash",
+    "Wash Concepts",
+]
 
 OUTPUT_CSV = "ibba_ecw_brokers.csv"
-
-SHEET_ID = "1MMnxeTTlf9noOKmmvGEBl9xPinsNTd12ZXv7lBa6S9A" 
+# Set to a profile URL to run a one-contact test (scrape that profile only, then save + upload to Google Sheet). None = normal full scrape.
+TEST_SINGLE_PROFILE_URL: Optional[str] = "https://www.ibba.org/broker-profile/florida/miami/harry-caruso/"
+# Set to a small number to limit profiles per state for quick runs. None = no limit.
+MAX_PROFILES_PER_STATE: Optional[int] = None
+SHEET_ID = "1MMnxeTTlf9noOKmmvGEBl9xPinsNTd12ZXv7lBa6S9A"
 WORKSHEET_NAME = "ECW Brokers"
 SERVICE_ACCOUNT_JSON = "ecw-broker-scraper-ef955c25c30d.json"
 
+# Final output headers per SOP
+OUTPUT_HEADERS = {
+    "Source (Website)": "Source (URL)",
+    "Notes (URL Link)": "Notes (Keywords Found)",
+}
 
-def _safe_text_from_locator(locator, default: str = "N/A") -> str:
+
+def _safe_text(locator, default: str = "N/A") -> str:
     try:
-        if locator is None:
+        if locator is None or locator.count() == 0:
             return default
-        if locator.count() == 0:
-            return default
-        return locator.first.inner_text().strip() or default
+        text = locator.first.inner_text(timeout=5000).strip()
+        return text or default
     except Exception:
         return default
 
 
-def _configure_main_search(page: Page) -> None:
-    """
-    On the IBBA search page:
-    - Fill City/Zip
-    - Set distance
-    - Select the "Auto Related Businesses" Specialty Area
-    - Submit the search
-    """
-    page.goto(IBBA_SEARCH_URL, wait_until="networkidle")
-
-    # City/Zip (required)
+def _safe_attr(locator, attr: str, default: Optional[str] = None) -> Optional[str]:
     try:
-        city_input = page.get_by_placeholder("City/Zip")
+        if locator is None or locator.count() == 0:
+            return default
+        return locator.first.get_attribute(attr)
     except Exception:
-        # Fallback: label-based lookup
-        city_input = page.get_by_label("City/Zip", exact=False)
-    city_input.fill(DEFAULT_CITY_OR_ZIP)
+        return default
 
-    # Distance select
+
+def _profile_contains_ecw_keyword(bio_specialties: str) -> Tuple[bool, List[str]]:
+    """
+    Narrow step: return (True, list of matched keywords) if bio/specialties
+    contains at least one ECW keyword; otherwise (False, []).
+    """
+    if not bio_specialties or bio_specialties == "N/A":
+        return False, []
+    text = bio_specialties.lower()
+    found = [kw for kw in ECW_KEYWORDS if kw.lower() in text]
+    return (len(found) > 0, found)
+
+
+def _extract_email_from_profile(page: Page) -> str:
+    """
+    Robust email extraction: mailto link first, then Contact button reveal,
+    then common obfuscation patterns. Returns "N/A" if not found.
+    """
+    # 1) mailto: link
     try:
-        distance_select = page.get_by_label("Distance")
-        distance_select.select_option(label=DEFAULT_DISTANCE_LABEL)
+        mailto = page.locator("a[href^='mailto:']").first
+        if mailto.count() > 0:
+            href = mailto.get_attribute("href")
+            if href and href.startswith("mailto:"):
+                addr = href.replace("mailto:", "").strip().split("?")[0].strip()
+                if addr and "@" in addr:
+                    return addr
     except Exception:
-        # If the above fails, you can adjust this selector using dev tools.
         pass
 
-    # Specialty Areas → Auto Related Businesses
-    #
-    # IBBA uses a custom widget here; the exact structure can change, so this
-    # block may need a small tweak. The general idea is:
-    #   1) Click "Specialty Areas" control to open it.
-    #   2) Click the "Auto Related Businesses" option.
+    # 2) Contact button / link that might reveal email
     try:
-        # Try a role-based approach first.
-        specialty_control = page.get_by_text("Specialty Areas", exact=False)
-        specialty_control.click()
-
-        option = page.get_by_text("Auto Related Businesses", exact=False)
-        option.click()
+        contact_btn = page.get_by_role("button", name=re.compile(r"contact", re.I)).first
+        if contact_btn.count() > 0:
+            contact_btn.click()
+            page.wait_for_load_state("load", timeout=10000)
+            mailto_after = page.locator("a[href^='mailto:']").first
+            if mailto_after.count() > 0:
+                href = mailto_after.get_attribute("href")
+                if href and "@" in href:
+                    return href.replace("mailto:", "").strip().split("?")[0].strip()
     except Exception:
-        # If this doesn't work, open DevTools on the page and replace this
-        # block with precise locators for the widget.
         pass
 
-    # Submit search
     try:
-        search_button = page.get_by_role("button", name="Find A Business Broker")
+        contact_link = page.get_by_role("link", name=re.compile(r"contact", re.I)).first
+        if contact_link.count() > 0:
+            contact_link.click()
+            page.wait_for_load_state("load", timeout=10000)
+            mailto_after = page.locator("a[href^='mailto:']").first
+            if mailto_after.count() > 0:
+                href = mailto_after.get_attribute("href")
+                if href and "@" in href:
+                    return href.replace("mailto:", "").strip().split("?")[0].strip()
     except Exception:
-        # Fallback if role lookup fails
-        search_button = page.get_by_text("Find A Business Broker", exact=False)
-
-    search_button.click()
-    # Let Playwright wait until the network is idle and results have rendered.
-    page.wait_for_load_state("networkidle")
-
-    # Ensure results section is visible
-    try:
-        page.get_by_text("Results for your Search").wait_for(timeout=15000)
-    except Exception:
-        # If this text changes, you can remove or adjust this guard.
         pass
 
-
-def _collect_profile_urls_from_results(page: Page) -> List[str]:
-    """
-    On a search results page, return absolute URLs for all "View Profile" links.
-    """
-    urls: List[str] = []
-
-    links = page.get_by_role("link", name="View Profile")
+    # 3) Obfuscation patterns in page text (e.g. "name [at] domain [dot] com")
     try:
-        count = links.count()
+        body_text = page.locator("body").inner_text(timeout=5000)
+        # [at] / [dot] / (at) / (dot)
+        for pat in [
+            r"[\w.\-+]+?\s*\[at\]\s*[\w.\-+]+\s*\[dot\]\s*\w+",
+            r"[\w.\-+]+?\s*\(at\)\s*[\w.\-+]+\s*\(dot\)\s*\w+",
+            r"[\w.\-+]+?\s*@\s*[\w.\-+]+\s*\.\s*\w+",
+        ]:
+            m = re.search(pat, body_text, re.I)
+            if m:
+                candidate = m.group(0).replace("[at]", "@").replace("[dot]", ".").replace("(at)", "@").replace("(dot)", ".").replace(" ", "")
+                if "@" in candidate and "." in candidate:
+                    return candidate
     except Exception:
-        return urls
+        pass
 
-    for i in range(count):
+    return "N/A"
+
+
+def _extract_bio_specialties(page: Page) -> str:
+    """Get Bio / Specialties text from profile page for keyword filtering."""
+    # Common section labels
+    for label in ["Specialty", "Specialties", "Bio", "About", "Areas of Expertise"]:
         try:
-            href = links.nth(i).get_attribute("href")
+            el = page.get_by_text(label, exact=False).first
+            if el.count() == 0:
+                continue
+            # Next sibling or nearby block
+            parent = el.locator("xpath=..")
+            if parent.count() > 0:
+                text = parent.first.inner_text(timeout=3000).strip()
+                if text and len(text) < 2000:
+                    return text
         except Exception:
-            href = None
-        if href:
-            urls.append(urljoin(page.url, href))
-
-    return urls
-
-
-def _go_to_next_results_page(page: Page) -> bool:
-    """
-    Try to advance to the next search results page.
-    Returns True if navigation occurred, False otherwise.
-    """
-    # You may need to tweak this selector depending on IBBA's pagination UI.
-    next_link = page.get_by_role("link", name="Next")
+            continue
     try:
-        if next_link.count() == 0:
-            return False
+        # Fallback: first substantial paragraph or div
+        block = page.locator("main p, main div, .content p, .profile p, [class*='bio']").first
+        if block.count() > 0:
+            return block.first.inner_text(timeout=3000).strip() or "N/A"
     except Exception:
-        return False
+        pass
+    return "N/A"
 
+
+def _extract_location_from_profile(page: Page) -> str:
+    """City, State from profile page."""
     try:
-        next_link.first.click()
-        page.wait_for_load_state("networkidle")
-        return True
+        loc_label = page.get_by_text("Location", exact=False).first
+        if loc_label.count() > 0:
+            sib = loc_label.locator("xpath=following-sibling::*[1]")
+            if sib.count() > 0:
+                return sib.first.inner_text(timeout=2000).strip() or "N/A"
     except Exception:
-        return False
+        pass
+    return "N/A"
 
 
-def _extract_contact_from_profile(page: Page, profile_url: str) -> BrokerContact:
+def _extract_contact_from_profile_only(page: Page, profile_url: str) -> Optional[BrokerContact]:
     """
-    On an individual broker profile page, capture:
-    - Full Name
-    - Company
-    - Location (City, State)
-    - Phone Number
-    - Email Address
-    - Notes (e.g. designations / specialties)
-
-    All fields gracefully fall back to "N/A".
+    Extract a single BrokerContact entirely from a profile page (no list page data).
+    Returns None if the profile does not pass the ECW keyword filter.
     """
-    page.goto(profile_url, wait_until="networkidle")
-
-    # Full name: typically the main heading on the page.
-    full_name = _safe_text_from_locator(page.get_by_role("heading"))
-
-    # Email: most reliably via mailto: links.
-    email = _safe_text_from_locator(page.locator("a[href^='mailto:']"))
-
-    # Phone: often in a tel: link or labeled field.
-    phone = _safe_text_from_locator(page.locator("a[href^='tel:']"))
-
-    # Company and location (City, State):
-    #
-    # These vary by layout; this implementation is conservative and may need a
-    # small tweak. We try some common patterns and then fall back to "N/A".
+    bio_specialties = _extract_bio_specialties(page)
+    passes, keywords_found = _profile_contains_ecw_keyword(bio_specialties)
+    if not passes:
+        return None
+    full_name = _safe_text(page.get_by_role("heading").first)
     company = "N/A"
-    location = "N/A"
-
     try:
-        # Try a label-based pattern like "Company" / "Location"
         company_label = page.get_by_text("Company", exact=False).first
-        company = (
-            company_label.locator("xpath=following-sibling::*[1]").inner_text().strip()
-        )
+        if company_label.count() > 0:
+            sib = company_label.locator("xpath=following-sibling::*[1]")
+            if sib.count() > 0:
+                company = sib.first.inner_text(timeout=2000).strip() or "N/A"
     except Exception:
         pass
-
-    try:
-        location_label = page.get_by_text("Location", exact=False).first
-        location = (
-            location_label.locator("xpath=following-sibling::*[1]")
-            .inner_text()
-            .strip()
-        )
-    except Exception:
-        pass
-
-    # Notes: capture visible text for specialties / designations where possible.
-    notes_parts: List[str] = []
-
-    try:
-        designation_block = page.get_by_text("Specialty", exact=False)
-        notes_parts.append(_safe_text_from_locator(designation_block))
-    except Exception:
-        pass
-
-    # Fallback: capture a small snippet from a specific section if you prefer.
-    notes = "; ".join([p for p in notes_parts if p and p != "N/A"]) or "N/A"
-
+    phone = _safe_text(page.locator("a[href^='tel:']").first)
+    location = _extract_location_from_profile(page)
+    email = _extract_email_from_profile(page)
+    notes = "; ".join(keywords_found) if keywords_found else "N/A"
     return BrokerContact(
         full_name=full_name,
         phone_number=phone,
@@ -210,51 +211,154 @@ def _extract_contact_from_profile(page: Page, profile_url: str) -> BrokerContact
     )
 
 
-def scrape_ibba_directory(headless: bool = True) -> None:
+def _get_listing_cards_and_links(page: Page):
     """
-    Main entry point:
-    - Run an IBBA search filtered to "Auto Related Businesses"
-    - Iterate through all result pages
-    - Visit each "View Profile" page and collect broker contacts
-    - De-duplicate and save to CSV
+    On a state directory page, find all broker listing blocks that contain
+    a "more details" link. Yields (card_locator, more_details_link_locator)
+    for each listing. Uses auto-waiting via Playwright locators.
     """
-    all_contacts: List[BrokerContact] = []
+    # Link that contains "more details" (with optional »)
+    more_details = page.get_by_role("link", name=re.compile(r"more\s+details\s*»?", re.I))
+    try:
+        n = more_details.count()
+    except Exception:
+        n = 0
+    for i in range(n):
+        link = more_details.nth(i)
+        try:
+            # Parent listing container: walk up to a likely card/row (div, article, li, section)
+            card = link.locator("xpath=ancestor::*[self::div or self::article or self::li or self::section][position()<=4][1]")
+            if card.count() == 0:
+                card = link.locator("xpath=..")
+            yield (card, link)
+        except Exception:
+            yield (None, link)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        page = browser.new_page()
 
-        _configure_main_search(page)
+def _text_from_card(card, page: Page) -> str:
+    if card is None or card.count() == 0:
+        return ""
+    try:
+        return card.first.inner_text(timeout=5000).strip()
+    except Exception:
+        return ""
 
-        # Iterate through all pages of results
-        while True:
-            profile_urls = _collect_profile_urls_from_results(page)
-            for url in profile_urls:
-                contact = _extract_contact_from_profile(page, url)
-                all_contacts.append(contact)
 
-            if not _go_to_next_results_page(page):
-                break
+def _parse_listing_card_text(card_text: str) -> Tuple[str, str, str]:
+    """
+    Heuristic: from a block of listing text, try to get Full Name, Company, Phone.
+    Name is often first line; phone often has digits/dashes; company may be second line or before phone.
+    """
+    name, company, phone = "N/A", "N/A", "N/A"
+    if not card_text:
+        return name, company, phone
+    lines = [ln.strip() for ln in card_text.splitlines() if ln.strip()]
+    # Phone: first token that looks like (xxx) xxx-xxxx or xxx-xxx-xxxx
+    phone_match = re.search(r"\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}", card_text)
+    if phone_match:
+        phone = phone_match.group(0).strip()
+    if lines:
+        name = lines[0]
+    if len(lines) >= 2 and lines[1] != phone and not re.match(r"^\(?\d{3}\)?", lines[1]):
+        company = lines[1]
+    return name, company, phone
 
-        browser.close()
 
-    # DataFrame creation, de-dup, and CSV output
+def _scrape_state_page(
+    page: Page, state_name: str, state_url: str, max_profiles: Optional[int] = None
+) -> List[BrokerContact]:
+    """
+    Navigate to state directory, iterate listings, open each profile via "more details",
+    extract list + profile data, and return only contacts that pass ECW keyword filter.
+    If max_profiles is set, stop after visiting that many profiles per state (for quick tests).
+    """
+    contacts: List[BrokerContact] = []
+    page.goto(state_url, wait_until="domcontentloaded", timeout=60000)
+    # Don't use networkidle — IBBA page has ongoing traffic. Wait for list content instead.
+    try:
+        page.get_by_role("link", name=re.compile(r"more\s+details", re.I)).first.wait_for(state="visible", timeout=25000)
+    except Exception:
+        return contacts
+
+    seen_urls = set()
+    visited = 0
+    for card, link in _get_listing_cards_and_links(page):
+        if max_profiles is not None and visited >= max_profiles:
+            break
+        try:
+            href = _safe_attr(link, "href")
+            if not href:
+                continue
+            profile_url = urljoin(state_url, href)
+            if profile_url in seen_urls:
+                continue
+            seen_urls.add(profile_url)
+            visited += 1
+
+            card_text = _text_from_card(card, page)
+            list_name, list_company, list_phone = _parse_listing_card_text(card_text)
+
+            # Open profile (more reliable than click for SPA)
+            page.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_load_state("load", timeout=15000)
+
+            bio_specialties = _extract_bio_specialties(page)
+            passes, keywords_found = _profile_contains_ecw_keyword(bio_specialties)
+            if not passes:
+                # Go back to state list for next listing
+                page.goto(state_url, wait_until="domcontentloaded", timeout=30000)
+                page.get_by_role("link", name=re.compile(r"more\s+details", re.I)).first.wait_for(state="visible", timeout=20000)
+                continue
+
+            email = _extract_email_from_profile(page)
+            location = _extract_location_from_profile(page)
+            # Prefer list page name/company/phone; fallback to profile if we have them
+            full_name = list_name if list_name != "N/A" else _safe_text(page.get_by_role("heading").first)
+            company = list_company if list_company != "N/A" else _safe_text(page.get_by_text("Company", exact=False).first.locator("xpath=following-sibling::*[1]"))
+            phone = list_phone if list_phone != "N/A" else _safe_text(page.locator("a[href^='tel:']").first)
+
+            notes = "; ".join(keywords_found) if keywords_found else "N/A"
+            contacts.append(
+                BrokerContact(
+                    full_name=full_name,
+                    phone_number=phone,
+                    location=location,
+                    company=company,
+                    email=email,
+                    source_url=profile_url,
+                    notes=notes,
+                )
+            )
+
+            # Return to state list for next broker
+            page.goto(state_url, wait_until="domcontentloaded", timeout=30000)
+            page.get_by_role("link", name=re.compile(r"more\s+details", re.I)).first.wait_for(state="visible", timeout=20000)
+        except Exception as e:
+            # Log and continue; avoid one bad listing killing the run
+            print(f"  Skip broker at {state_url}: {e}")
+            try:
+                page.goto(state_url, wait_until="domcontentloaded", timeout=30000)
+                page.get_by_role("link", name=re.compile(r"more\s+details", re.I)).first.wait_for(state="visible", timeout=20000)
+            except Exception:
+                pass
+            continue
+
+    return contacts
+
+
+def _save_and_upload_contacts(all_contacts: List[BrokerContact]) -> None:
+    """Build dataframe, dedupe, save CSV, upload to Google Sheet. Used on normal finish and on Ctrl+C."""
     df = contacts_to_dataframe(all_contacts)
     df_clean = clean_contacts_dataframe(df)
-    save_to_csv(df_clean, OUTPUT_CSV)
-
-    print(f"Scraped {len(all_contacts)} raw contacts.")
-    print(f"{len(df_clean)} contacts after de-duplication.")
-    print(f"Saved CSV to: {OUTPUT_CSV}")
-
-    # Optional: also push to Google Sheets if SHEET_ID is set.
+    df_out = df_clean.rename(columns=OUTPUT_HEADERS)
+    save_to_csv(df_out, OUTPUT_CSV)
+    print(f"Total ECW-matching brokers: {len(all_contacts)}.")
+    print(f"After de-duplication: {len(df_out)}.")
+    print(f"Saved to: {OUTPUT_CSV}")
     if SHEET_ID:
-        print(
-            f"Uploading {len(df_clean)} contacts to Google Sheet {SHEET_ID!r}, "
-            f"worksheet {WORKSHEET_NAME!r}..."
-        )
+        print(f"Uploading to Google Sheet {SHEET_ID!r}, worksheet {WORKSHEET_NAME!r}...")
         upload_dataframe_to_google_sheet(
-            df_clean,
+            df_out,
             sheet_id=SHEET_ID,
             worksheet_name=WORKSHEET_NAME,
             service_account_json_path=SERVICE_ACCOUNT_JSON,
@@ -262,7 +366,66 @@ def scrape_ibba_directory(headless: bool = True) -> None:
         print("Google Sheets upload completed.")
 
 
-if __name__ == "__main__":
-    # Run non-headless by default so you can see what the browser is doing.
-    scrape_ibba_directory(headless=False)
+def run_single_profile_test(profile_url: str, headless: bool = False) -> None:
+    """
+    Scrape one profile URL, then save to CSV and upload to Google Sheet.
+    Used to verify end-to-end (e.g. Harry Caruso) and test Google Sheets.
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        page = browser.new_page()
+        page.set_default_timeout(30000)
+        page.set_default_navigation_timeout(60000)
+        page.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_load_state("load", timeout=15000)
+        contact = _extract_contact_from_profile_only(page, profile_url)
+        browser.close()
+    if contact is None:
+        print("This profile did not match ECW keywords. No contact added.")
+        return
+    print(f"Extracted 1 contact: {contact.full_name}. Saving and uploading...")
+    _save_and_upload_contacts([contact])
+    print("Single-profile test done.")
 
+
+def scrape_ibba_directory(headless: bool = True) -> None:
+    """
+    Wide-to-Narrow IBBA scraper for ECW brokers in NY and FL:
+    - Scrape state directory pages (no search radius).
+    - Open each broker via "more details »", extract list + profile data.
+    - Keep only brokers whose Bio/Specialties contain an ECW keyword.
+    - Deduplicate, save CSV, upload to Google Sheets with requested headers.
+    - On Ctrl+C: stop scraping and still save/upload whatever was collected.
+    """
+    all_contacts: List[BrokerContact] = []
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless)
+            page = browser.new_page()
+            page.set_default_timeout(30000)
+            page.set_default_navigation_timeout(60000)
+
+            for state_name, state_url in STATE_DIRECTORY_URLS:
+                print(f"Scraping state: {state_name} — {state_url}")
+                state_contacts = _scrape_state_page(
+                    page, state_name, state_url, max_profiles=MAX_PROFILES_PER_STATE
+                )
+                all_contacts.extend(state_contacts)
+                print(f"  Collected {len(state_contacts)} ECW-matching brokers from {state_name}.")
+
+            browser.close()
+
+        _save_and_upload_contacts(all_contacts)
+    except KeyboardInterrupt:
+        print("\nStopped by user (Ctrl+C). Saving and uploading what we have so far...")
+        _save_and_upload_contacts(all_contacts)
+        print("Done.")
+
+
+if __name__ == "__main__":
+    if TEST_SINGLE_PROFILE_URL:
+        print(f"Single-profile test: {TEST_SINGLE_PROFILE_URL}")
+        run_single_profile_test(TEST_SINGLE_PROFILE_URL, headless=False)
+    else:
+        scrape_ibba_directory(headless=False)
