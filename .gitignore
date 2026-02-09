@@ -1,0 +1,13 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Local credentials / service account keys
+*service-account*.json
+*credentials*.json
+ecw-broker-scraper-*.json
+
