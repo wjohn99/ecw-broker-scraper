@@ -1,61 +1,58 @@
 # ECW Broker Scraper
 
-Python tools to collect Express Car Wash (ECW) broker contact data into a Google Sheet using Playwright for browser automation and Pandas for data handling.
-
-Each target website gets its **own scraper script** (for example, `ibba_scraper.py` for the IBBA directory).
+Python scrapers that find Express Car Wash (ECW) brokers from multiple directories and push matches to a shared Google Sheet. Each site gets its own script and worksheet tab.
 
 ---
 
 ### Setup
 
-1. **Install dependencies:**
-
 ```bash
 pip install -r requirements.txt
-```
-
-2. **Install Playwright browsers** (one-time):
-
-```bash
 playwright install
 ```
 
+Create a Google Cloud service account with the Google Sheets & Drive API plugins, download the JSON key, and place it in the project root.
+
 ---
 
-### IBBA Directory Scraper
+### Scrapers
 
-File: `ibba_scraper.py`
+#### IBBA — `ibba_scraper.py`
 
-This script:
-
-- Navigates to the IBBA Directory (`https://www.ibba.org/find-a-business-broker/`).
-- Runs a search (currently configured for a broad U.S. search) and applies the **Auto Related Businesses** specialty.
-- Iterates through results and opens **View Profile** for each broker.
-- Extracts:
-  - Full Name
-  - Phone Number
-  - Location (City, State)
-  - Company
-  - Email Address
-  - Source (Website URL)
-  - Notes
-- Uses shared helpers in `ecw_scraper_data.py` to:
-  - Normalize missing fields to `"N/A"`.
-  - Build a Pandas DataFrame with the exact SOP headers.
-  - De-duplicate brokers found across pages/searches.
-  - Save to CSV (default `ibba_ecw_brokers.csv`).
-
-**Run it from the project root**
+Scrapes the IBBA state directories (FL & NY). Opens each broker's "more details" profile, checks bio/specialties for ECW keywords, extracts contact info. Worksheet tab: **IBBA**.
 
 ```bash
 python ibba_scraper.py
 ```
 
-You can open `ibba_scraper.py` and adjust:
+#### BizQuest — `bizquest_scraper.py`
 
-- The starting city/zip and distance (search radius).
-- Any selectors if IBBA updates their HTML.
+Paginates through BizQuest broker directories (FL & NY). Opens each profile, checks Broker Bio tab for keywords, extracts from Company Info tab. Worksheet tab: **BizQuest**.
 
-- `ecw_scraper_google_sheets.py` is a helper for pushing any DataFrame to a Google Sheet via `gspread` and a Google Cloud service account.
+```bash
+python bizquest_scraper.py # both states (clears sheet then appends)
+python bizquest_scraper.py --fl # Florida only (appends sheet starting on next blank row)
+python bizquest_scraper.py --ny # New York only (appends sheet starting on next blank row)
+```
+
+#### BusinessBroker.net — `businessbroker_scraper.py`
+
+Scrapes BusinessBroker.net state pages (FL & NY). All brokers are on one page per state. Opens each profile, scrolls to load Sold Listings, checks full page for keywords. Worksheet tab: **BusinessBroker**.
+
+```bash
+python businessbroker_scraper.py # both states (clears sheet then appends)
+python businessbroker_scraper.py --fl # Florida only (appends sheet starting on next blank row)
+python businessbroker_scraper.py --ny # New York only (appends sheet starting on next blank row)
+```
+
+---
+
+### Keywords
+
+All scrapers use the same keyword list: **Car Wash, Express Car Wash, Express Wash, Tunnel Wash, Carwash, Conveyor Wash**.
+
+### Columns
+
+All scrapers produce the same columns: **Full Name, Phone Number, Location (City, State), Company, Email Address, URL, Notes**. No "Source" column — the worksheet tab name identifies the source.
 
 ---
