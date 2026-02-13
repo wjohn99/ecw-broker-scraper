@@ -23,9 +23,9 @@ class BrokerContact:
 CSV_COLUMNS = [
     "Full Name",
     "Phone Number",
+    "Email Address",
     "Location (City, State)",
     "Company",
-    "Email Address",
     "URL",
     "Notes (URL Link)",
 ]
