@@ -29,6 +29,9 @@ NY_DIRECTORY_URL = (
 
 START_PAGE = 1
 COLLECT_PAGES = 50
+# NY directory: scrape only page 21 (directory ends at page 21)
+NY_START_PAGE = 21
+NY_COLLECT_PAGES = 1
 
 KEYWORDS = [
     "express car wash",
@@ -705,40 +708,59 @@ _PROFILE_SLUG_RE = re.compile(r"crexi\.com/profile/([a-z0-9\-]+)", re.I)
 
 
 def _get_profile_urls_from_page(page: Page, base_url: str) -> List[str]:
-    try:
-        profile_links = page.locator("a[href*='/profile/']")
-        n = profile_links.count()
-    except Exception:
-        return []
-
+    """Extract all broker profile URLs from the current page. Scrolls and waits to ensure all content is loaded."""
+    # Scroll to load all content
+    _scroll_until_content_loaded(page, max_scrolls=8, pause=0.4)
+    time.sleep(1)
+    
     all_profile_urls: List[str] = []
     seen: Set[str] = set()
-    for i in range(n):
+    
+    # Try multiple selectors to catch all profile links
+    selectors = [
+        "a[href*='/profile/']",
+        "a[href*='crexi.com/profile']",
+        "[href*='/profile/']",
+    ]
+    
+    for selector in selectors:
         try:
-            href = profile_links.nth(i).get_attribute("href")
-            if not href:
-                continue
-            full = urljoin(base_url, href)
-            full_lower = full.lower()
-            if "/profile/" not in full_lower:
-                continue
-            match = _PROFILE_SLUG_RE.search(full_lower)
-            if not match or not match.group(1) or len(match.group(1)) < 3:
-                continue
-            if full in seen:
-                continue
-            seen.add(full)
-            all_profile_urls.append(full)
+            profile_links = page.locator(selector)
+            n = profile_links.count()
+            for i in range(n):
+                try:
+                    href = profile_links.nth(i).get_attribute("href")
+                    if not href:
+                        continue
+                    full = urljoin(base_url, href)
+                    full_lower = full.lower()
+                    if "/profile/" not in full_lower:
+                        continue
+                    match = _PROFILE_SLUG_RE.search(full_lower)
+                    if not match or not match.group(1) or len(match.group(1)) < 3:
+                        continue
+                    if full in seen:
+                        continue
+                    seen.add(full)
+                    all_profile_urls.append(full)
+                except Exception:
+                    continue
         except Exception:
             continue
-
-    if not all_profile_urls:
-        return []
-
+    
+    # Remove duplicates while preserving order
+    unique_urls = []
+    seen_unique = set()
+    for url in all_profile_urls:
+        if url not in seen_unique:
+            seen_unique.add(url)
+            unique_urls.append(url)
+    
+    # Skip top 3 (usually header/nav links)
     skip_top_n = 3
-    if len(all_profile_urls) > skip_top_n:
-        return all_profile_urls[skip_top_n:]
-    return all_profile_urls
+    if len(unique_urls) > skip_top_n:
+        return unique_urls[skip_top_n:]
+    return unique_urls
 
 
 def _has_next_page(page: Page) -> bool:
@@ -770,37 +792,84 @@ def _has_next_page(page: Page) -> bool:
 
 
 def _click_next_page(page: Page) -> bool:
+    """Click Next button/link. Scrolls to bottom, waits, then tries multiple selectors."""
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    time.sleep(1)
-    next_btn = page.get_by_role("button", name=re.compile(r"next", re.I)).first
-    if next_btn.count() > 0:
-        next_btn.scroll_into_view_if_needed(timeout=5000)
-        time.sleep(0.5)
-        next_btn.click()
-        time.sleep(2)
-        return True
-    next_link = page.get_by_role("link", name=re.compile(r"next", re.I)).first
-    if next_link.count() > 0:
-        next_link.scroll_into_view_if_needed(timeout=5000)
-        time.sleep(0.5)
-        next_link.click()
-        time.sleep(2)
-        return True
-    next_arrow = page.locator("[aria-label*='next' i], [aria-label*='Next' i]").first
-    if next_arrow.count() > 0:
-        next_arrow.scroll_into_view_if_needed(timeout=5000)
-        time.sleep(0.5)
-        next_arrow.click()
-        time.sleep(2)
-        return True
+    time.sleep(1.5)
+    
+    # Try button first
+    try:
+        next_btn = page.get_by_role("button", name=re.compile(r"next", re.I)).first
+        if next_btn.count() > 0:
+            disabled = next_btn.get_attribute("disabled")
+            aria_disabled = next_btn.get_attribute("aria-disabled")
+            if disabled is None and aria_disabled != "true":
+                next_btn.scroll_into_view_if_needed(timeout=5000)
+                time.sleep(0.5)
+                next_btn.click()
+                time.sleep(3)  # Wait longer for page to load
+                return True
+    except Exception:
+        pass
+    
+    # Try link
+    try:
+        next_link = page.get_by_role("link", name=re.compile(r"next", re.I)).first
+        if next_link.count() > 0:
+            next_link.scroll_into_view_if_needed(timeout=5000)
+            time.sleep(0.5)
+            next_link.click()
+            time.sleep(3)
+            return True
+    except Exception:
+        pass
+    
+    # Try aria-label
+    try:
+        next_arrow = page.locator("[aria-label*='next' i], [aria-label*='Next' i]").first
+        if next_arrow.count() > 0:
+            disabled = next_arrow.get_attribute("disabled")
+            aria_disabled = next_arrow.get_attribute("aria-disabled")
+            if disabled is None and aria_disabled != "true":
+                next_arrow.scroll_into_view_if_needed(timeout=5000)
+                time.sleep(0.5)
+                next_arrow.click()
+                time.sleep(3)
+                return True
+    except Exception:
+        pass
+    
+    # Try numbered page links (e.g. "22", "23" if we're on page 21)
+    try:
+        # Look for page number links in pagination
+        page_links = page.locator("a[href*='page'], button[aria-label*='page']")
+        count = page_links.count()
+        for i in range(count):
+            try:
+                link = page_links.nth(i)
+                text = link.inner_text(timeout=2000).strip()
+                # If it's a number higher than current, try clicking
+                if text.isdigit():
+                    link.scroll_into_view_if_needed(timeout=3000)
+                    time.sleep(0.3)
+                    link.click()
+                    time.sleep(3)
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    
     return False
 
 
 def _collect_all_profile_urls(page: Page, directory_url: str, start_page: int = 1, max_pages: int = 10) -> List[str]:
+    """Collect profile URLs by clicking Next through pages. Start on page 1; click Next until we reach start_page, then collect through end_page. No page reload (keeps Special Purpose filter)."""
     all_urls: List[str] = []
     seen: Set[str] = set()
     end_page = start_page + max_pages - 1
     page_num = 1
+    consecutive_failures = 0
+    max_failures = 2
 
     while page_num <= end_page:
         try:
@@ -811,31 +880,57 @@ def _collect_all_profile_urls(page: Page, directory_url: str, start_page: int = 
             if page_num >= start_page:
                 profile_urls = _get_profile_urls_from_page(page, current_url)
                 if not profile_urls:
-                    break
-                new_count = 0
-                for u in profile_urls:
-                    if u not in seen:
-                        seen.add(u)
-                        all_urls.append(u)
-                        new_count += 1
-                print(f"  Page {page_num}: {len(profile_urls)} links ({new_count} new) — total collected: {len(all_urls)}")
+                    print(f"  Page {page_num}: no profile links found — continuing...")
+                    # Don't break - maybe page is still loading, try Next anyway
+                else:
+                    new_count = 0
+                    for u in profile_urls:
+                        if u not in seen:
+                            seen.add(u)
+                            all_urls.append(u)
+                            new_count += 1
+                    print(f"  Page {page_num}: {len(profile_urls)} links ({new_count} new) — total collected: {len(all_urls)}")
+                    consecutive_failures = 0  # Reset on success
             else:
                 if page_num == 1 and start_page > 1:
-                    print("  Waiting 8 seconds for you to set the filter before advancing to page {}...".format(start_page))
-                    time.sleep(8)
-                print(f"  Advancing to page {start_page}... (now on page {page_num})")
+                    print(f"  Advancing to page {start_page}: clicking Next (now on page {page_num})...")
+                else:
+                    print(f"  Advancing... (now on page {page_num}, target page {start_page})")
 
             if page_num >= end_page:
+                print(f"  Reached end page {end_page}. Stopping collection.")
                 break
+            
+            # Try to go to next page
             if not _has_next_page(page):
-                break
+                consecutive_failures += 1
+                print(f"  Page {page_num}: No Next button found (failure {consecutive_failures}/{max_failures})")
+                if consecutive_failures >= max_failures:
+                    print(f"  Stopping: {consecutive_failures} consecutive failures to find Next button.")
+                    break
+                time.sleep(2)  # Wait a bit and try again
+                continue
+            
             if not _click_next_page(page):
-                break
+                consecutive_failures += 1
+                print(f"  Page {page_num}: Failed to click Next (failure {consecutive_failures}/{max_failures})")
+                if consecutive_failures >= max_failures:
+                    print(f"  Stopping: {consecutive_failures} consecutive failures to click Next.")
+                    break
+                time.sleep(2)
+                continue
+            
+            # Successfully clicked Next
+            consecutive_failures = 0
             page_num += 1
-            time.sleep(random.uniform(1, 2))
+            time.sleep(random.uniform(1.5, 2.5))
         except Exception as e:
             print(f"  Page {page_num}: {e}")
-            break
+            consecutive_failures += 1
+            if consecutive_failures >= max_failures:
+                break
+            time.sleep(2)
+            continue
 
     return all_urls
 
@@ -845,12 +940,15 @@ def _scrape_directory(
     directory_url: str,
     seen_urls: Set[str],
     *,
+    start_page: int = START_PAGE,
+    max_pages: int = COLLECT_PAGES,
     sheet_id: Optional[str] = None,
     worksheet_name: str = "CRE Brokers",
     service_account_json: Optional[str] = None,
 ) -> List[BrokerContact]:
-    print(f"  Phase 1: Collecting broker profile links from page {START_PAGE} to {START_PAGE + COLLECT_PAGES - 1}...")
-    profile_urls = _collect_all_profile_urls(page, directory_url, start_page=START_PAGE, max_pages=COLLECT_PAGES)
+    end_page = start_page + max_pages - 1
+    print(f"  Phase 1: Collecting broker profile links from page {start_page} to {end_page}...")
+    profile_urls = _collect_all_profile_urls(page, directory_url, start_page=start_page, max_pages=max_pages)
     print(f"  Collected {len(profile_urls)} profile URLs. Phase 2: Scraping each broker...")
 
     contacts: List[BrokerContact] = []
@@ -1065,14 +1163,18 @@ def scrape_crexi_directory(test_url: Optional[str] = None, use_ny: bool = False)
                         return
                     time.sleep(2)
                 
-                print("Waiting 8 seconds before starting to scrape so you can adjust filters if needed...")
-                time.sleep(8)
+                print("Waiting 10 seconds before starting to scrape so you can adjust filters if needed...")
+                time.sleep(10)
 
                 print("Scraping directory...")
+                start_page = NY_START_PAGE if use_ny else START_PAGE
+                max_pages = NY_COLLECT_PAGES if use_ny else COLLECT_PAGES
                 contacts = _scrape_directory(
                     page,
                     directory_url,
                     seen_urls,
+                    start_page=start_page,
+                    max_pages=max_pages,
                     sheet_id=SHEET_ID or None,
                     worksheet_name=WORKSHEET_NAME,
                     service_account_json=SERVICE_ACCOUNT_JSON,
